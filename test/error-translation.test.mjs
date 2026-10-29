@@ -732,6 +732,26 @@ test("a local Anthropic tool-argument conversion is not a provider rejection", (
   assert.doesNotMatch(payload.error.message, /usage limit reached/);
 });
 
+test("local Chat history errors retain their cause through gateway wrappers", () => {
+  const message = "Cannot safely replay tool history: A real result has no preceding matching call. " +
+    "Restore the matching call/result history before retrying.";
+  const envelope = JSON.stringify({ error: { type: "invalid_chat_tool_history", message } });
+  for (const bodyText of [envelope, JSON.stringify({ error: {
+    message: "litellm.BadRequestError: OpenAIException - " + envelope,
+  } })]) {
+    const payload = translateGatewayError({ status: 400, bodyText, modelName: "fixture", providerName: "fixture-provider" });
+    assert.equal(payload.error.code, "invalid_chat_tool_history");
+    assert.equal(payload.error.type, "invalid_request_error");
+    assert.equal(payload.error.param, "messages");
+    assert.equal(payload.error.message, message);
+    assert.equal(gatewayErrorStatus({ status: 502, bodyText }), 400);
+  }
+  const providerError = translateGatewayError({ status: 400, bodyText: JSON.stringify({ error: {
+    message: "Provider detail quotes Cannot safely replay tool history: example.",
+  } }), modelName: "fixture", providerName: "fixture-provider" });
+  assert.equal(providerError.error.code, "400");
+});
+
 test("a plan without API access is not reported as a bad credential", () => {
   // Command Code's verbatim answer to a valid Go-plan key on /provider/v1.
   const translated = translateGatewayError({

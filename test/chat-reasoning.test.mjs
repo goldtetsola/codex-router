@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -13,6 +14,7 @@ import {
   usesNativeChatReasoning,
 } from "../src/chat-reasoning.mjs";
 import { MODEL_BY_SLUG } from "../src/model-registry.mjs";
+import { userModelEntry } from "../src/user-models.mjs";
 import { childOutput, waitForListeners } from "./listener-readiness.mjs";
 
 test("native chat reasoning stays scoped to established history contracts", () => {
@@ -140,8 +142,8 @@ test("thinking families behind Chat Completions resellers replay reasoning nativ
 // Optional, offline integration with the installed version pinned in requirements/python.txt.
 // No provider requests; an explicitly supplied invalid runtime must fail.
 const python = process.env.MODEL_ROUTER_TEST_LITELLM_PYTHON;
-test("pinned LiteLLM replays Chat reasoning exactly once", { skip: !python, timeout: 120000 }, async (t) => {
-  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+test("pinned LiteLLM preserves Chat reasoning and tool history", { skip: !python, timeout: 120000 }, async (t) => {
+  const root = process.env.MODEL_ROUTER_TEST_SOURCE_ROOT || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const version = readFileSync(path.join(root, "requirements/python.txt"), "utf8")
     .match(/^litellm==([^\s]+)/m)?.[1];
   assert.ok(version, "LiteLLM must be pinned in the repository lock");
@@ -194,6 +196,53 @@ test("pinned LiteLLM replays Chat reasoning exactly once", { skip: !python, time
     { type: "message", role: "assistant", content: [{ type: "output_text", text: "FINAL_VISIBLE" }] },
     { type: "message", role: "user", content: "Continue the synthetic check." },
   ];
+  const toolHistories = [
+    ["Sonnet", "claude-sonnet-5.5", 3, 4],
+    ["DeepSeek", "deepseek-v4.1-flash-1017", 6, 7],
+  ].map(([name, upstreamId, calls, instructions]) => ({
+    name, upstreamId,
+    input: [
+      { type: "message", role: "user", content: "Read the fixture sources." },
+      ...Array.from({ length: calls }, (_, i) => ({
+        type: "function_call", call_id: `${name}_${i}`, name: "probe", arguments: "{}",
+      })),
+      ...Array.from({ length: instructions }, (_, i) => ({
+        type: "message", role: "developer", content: `Keep fixture instruction ${name}_${i}.`,
+      })),
+      ...Array.from({ length: calls }, (_, i) => ({
+        type: "function_call_output", call_id: `${name}_${i}`, output: `Source ${name}_${i}\nExact Unicode: \u{1f9ea}`,
+      })),
+    ],
+  }));
+  // Local incident replays can supply private fixtures without checking them in.
+  if (process.env.MODEL_ROUTER_TEST_TOOL_HISTORY_FIXTURES) {
+    toolHistories.push(...JSON.parse(readFileSync(process.env.MODEL_ROUTER_TEST_TOOL_HISTORY_FIXTURES, "utf8")));
+  }
+  const digest = value => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  const text = content => typeof content === "string" ? content : content.map(part => part.text).join("");
+  function assertToolHistory(messages, history) {
+    const expected = history.filter(item => item.type === "function_call_output");
+    const actual = messages.filter(message => message.role === "tool");
+    assert.equal(actual.length, expected.length, "Every real output must arrive exactly once");
+    assert.equal(digest(actual.map(message => [message.tool_call_id, message.content])),
+      digest(expected.map(item => [item.call_id, item.output])), "Result IDs, contents and order must survive; exact outputs: " +
+        actual.filter(message => expected.some(item => item.call_id === message.tool_call_id && item.output === message.content)).length + "/" + expected.length);
+    const instructions = items => items.filter(item => ["developer", "system"].includes(item.role))
+      .map(item => [item.role, text(item.content)]);
+    // Pinned LiteLLM maps developer to system on generic OpenAI routes before
+    // the forwarder. Keep every instruction at that authority, in exact order.
+    const expectedInstructions = instructions(history).map(([role, value]) => [role === "developer" ? "system" : role, value]);
+    assert.equal(digest(instructions(messages)), digest(expectedInstructions),
+      "Every instruction must keep its translated role, text and relative order");
+    const calls = messages.flatMap(message => message.tool_calls || []);
+    assert.deepEqual(calls.map(call => call.id), expected.map(item => item.call_id));
+    for (const message of messages) {
+      if (!message.tool_calls?.length) continue;
+      const index = messages.indexOf(message);
+      assert.ok(messages.slice(index + 1, index + 1 + message.tool_calls.length).every(item => item.role === "tool"),
+        "Strict providers require adjacent results");
+    }
+  }
   function assertHistory(messages) {
     const serialized = JSON.stringify(messages);
     for (const marker of ["SUMMARY_REASONING", "TOOL_REASONING_ONE", "TOOL_REASONING_TWO", "ANSWER_REASONING"]) {
@@ -228,6 +277,15 @@ test("pinned LiteLLM replays Chat reasoning exactly once", { skip: !python, time
     });
     const routerPort = await port();
     const forwarderPort = await port();
+    const providersFile = path.join(state, "fixture-providers.json");
+    const modelsFile = path.join(state, "fixture-models.json");
+    const models = [...new Set(toolHistories.map(fixture => fixture.upstreamId))].map((upstreamId, priority) =>
+      userModelEntry({ providerId: "history-fixture", upstreamId, priority }));
+    writeFileSync(providersFile, JSON.stringify({ version: 1, providers: [{
+      id: "history-fixture", displayName: "Local history fixture", adapter: "openai-chat",
+      baseUrl: `http://127.0.0.1:${upstream.address().port}/v1`, headers: {}, allowPrivate: true, enabled: true,
+    }] }));
+    writeFileSync(modelsFile, JSON.stringify({ version: 1, models }));
     const pythonCode = String.raw`
 import asyncio, importlib.metadata, json, sys
 import litellm
@@ -241,7 +299,10 @@ payload.update(model="openai/" + payload["model"], api_base=sys.argv[1],
 async def main():
     result = await litellm.aresponses(**payload)
     print(result.model_dump_json(exclude_none=True))
-asyncio.run(main())
+try:
+    asyncio.run(main())
+except litellm.BadRequestError as error:
+    print(json.dumps({"fixture_error_status": error.status_code, "error": {"message": str(error)}}))
   `;
     const gateway = await listen(async (request, response) => {
       const payload = await bodyJson(request);
@@ -261,7 +322,10 @@ asyncio.run(main())
       child.once("error", (error) => respond(response, 502, { error: { message: error.message } }));
       child.once("exit", (code) => {
         if (code !== 0) respond(response, 502, { error: { message: stderr || "Offline translator failed" } });
-        else { response.writeHead(200, { "Content-Type": "application/json" }); response.end(stdout); }
+        else {
+          const result = JSON.parse(stdout);
+          respond(response, result.fixture_error_status || 200, result.fixture_error_status ? { error: result.error } : result);
+        }
       });
     });
     const env = {
@@ -270,6 +334,7 @@ asyncio.run(main())
       CODEX_ROUTER_PORT: String(routerPort), CODEX_ROUTER_API_PORT: String(forwarderPort),
       CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.address().port}/v1`,
       CODEX_ROUTER_SHOW_ALL_MODELS: "1", CODEX_ROUTER_QUIET: "1", CODEX_ROUTER_DISABLE_DISCOVERY: "1",
+      MODEL_ROUTER_GENERIC_PROVIDERS: providersFile, MODEL_ROUTER_USER_MODELS: modelsFile,
       DEEPSEEK_API_BASE_URL: `http://127.0.0.1:${upstream.address().port}/v1`, DEEPSEEK_API_KEY: "TEST_DEEPSEEK_KEY",
       ZAI_CODING_BASE_URL: `http://127.0.0.1:${upstream.address().port}/v1`, ZAI_API_KEY: "TEST_ZAI_KEY",
       COMMANDCODE_BASE_URL: `http://127.0.0.1:${upstream.address().port}/v1`, COMMAND_CODE_API_KEY: "TEST_COMMANDCODE_KEY",
@@ -283,6 +348,45 @@ asyncio.run(main())
       { name: "api-forwarder /health", url: `http://127.0.0.1:${forwarderPort}/health`, headers: { Authorization: `Bearer ${internal}` } },
       { name: "router /models", url: `${base}/models` },
     ], { children: services, output });
+    for (const fixture of toolHistories) {
+      for (const adjacent of [false, true]) {
+        await t.test(`${fixture.name} ${adjacent ? "adjacent control" : "recorded instruction order"}`, async () => {
+          const history = adjacent ? [
+            ...fixture.input.filter(item => !["developer", "system"].includes(item.role)),
+            ...fixture.input.filter(item => ["developer", "system"].includes(item.role)),
+          ] : fixture.input;
+          const model = models.find(entry => entry.upstreamModel === fixture.upstreamId);
+          assert.ok(model, "Fixture model must be registered");
+          const before = requests.length;
+          const response = await fetch(`${base}/responses`, {
+            method: "POST", headers: { "Content-Type": "application/json" }, signal: AbortSignal.timeout(30000),
+            body: JSON.stringify({ model: model.slug, input: history, stream: false }),
+          });
+          await response.arrayBuffer();
+          assert.equal(response.status, 200, "Offline history replay must complete");
+          assert.equal(requests.length, before + 1, "Replay must reach the local provider once");
+          assertToolHistory(requests.at(-1).messages, history);
+        });
+      }
+    }
+    await t.test("unsafe history reports its local cause to the outer caller", async () => {
+      const before = requests.length;
+      const response = await fetch(`${base}/responses`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, signal: AbortSignal.timeout(30000),
+        body: JSON.stringify({ model: models[0].slug, stream: false, input: [
+          { role: "user", content: "Read the fixture." },
+          { type: "function_call", name: "probe", call_id: "invalid_boundary", arguments: "{}" },
+          { role: "user", content: "A new turn starts here." },
+          { type: "function_call_output", call_id: "invalid_boundary", output: "Real fixture result" },
+        ] }),
+      });
+      const body = await response.json();
+      assert.equal(response.status, 400, JSON.stringify(body));
+      assert.equal(body.error.code, "invalid_chat_tool_history", JSON.stringify(body));
+      assert.equal(body.error.type, "invalid_request_error");
+      assert.doesNotMatch(body.error.message, /provider.*rejected|provider.*unavailable/i);
+      assert.equal(requests.length, before, "Unsafe history must fail before the provider is called");
+    });
     for (const model of ["zai-coding/glm-5.3", "deepseek/deepseek-v4-flash", "commandcode/deepseek-v4-flash"]) {
       for (negativeControl of [false, true]) {
         const response = await fetch(`${base}/responses`, {
