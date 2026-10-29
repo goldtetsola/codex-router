@@ -4891,8 +4891,6 @@ test("API forwarder synthesizes missing tool results for incomplete tool_calls h
             // Only one of the two call ids has a real tool result.
             { role: "tool", tool_call_id: "call_A", content: "done" },
             { role: "user", content: "what next?" },
-            // Orphan tool row after a user turn should not break the contract.
-            { role: "tool", tool_call_id: "call_orphan", content: "stale" },
           ],
         }),
       },

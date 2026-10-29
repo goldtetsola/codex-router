@@ -21,6 +21,7 @@ import {
 
 import {
   applyKeepAliveTimeouts,
+  coalesceAssistantRuns,
   endStreamedResponse,
   formatErrorChain,
   HOP_BY_HOP_HEADERS,
@@ -308,55 +309,6 @@ function dashscopeEffortFamily(upstreamModel) {
   return DASHSCOPE_EFFORT_FAMILIES.find((entry) => entry.match.test(upstream));
 }
 
-// Strict chat-completions providers (e.g. MiniMax) reject a turn whose tool
-// result messages do not immediately follow the assistant message carrying the
-// matching tool_calls. When the upstream Responses-API history is translated to
-// chat completions, an assistant turn that produced both tool_calls and a text
-// message can arrive as two consecutive assistant messages (one with
-// tool_calls, one with the text), so the tool results no longer follow the
-// tool-call-bearing assistant. Coalesce runs of consecutive assistant messages
-// into a single assistant message (combining content and tool_calls) so the
-// chat-completions contract holds. This is a safe normalization: consecutive
-// assistant messages are not a valid multi-turn shape, so merging them cannot
-// change a well-formed conversation.
-function combineAssistantContent(target, source) {
-  const sourceContent = source.content;
-  if (sourceContent === undefined || sourceContent === null) return;
-  const targetContent = target.content;
-  if (targetContent === undefined || targetContent === null || targetContent === "") {
-    target.content = sourceContent;
-    return;
-  }
-  if (typeof targetContent === "string" && typeof sourceContent === "string") {
-    target.content = `${targetContent}\n${sourceContent}`;
-    return;
-  }
-  const targetBlocks = Array.isArray(targetContent) ? targetContent : [targetContent];
-  const sourceBlocks = Array.isArray(sourceContent) ? sourceContent : [sourceContent];
-  target.content = [...targetBlocks, ...sourceBlocks];
-}
-
-function coalesceAssistantMessages(messages) {
-  if (!Array.isArray(messages) || messages.length < 2) return messages;
-  const coalesced = [];
-  for (const message of messages) {
-    const previous = coalesced[coalesced.length - 1];
-    if (
-      message?.role === "assistant" &&
-      previous?.role === "assistant" &&
-      (Array.isArray(previous.tool_calls) || Array.isArray(message.tool_calls))
-    ) {
-      combineAssistantContent(previous, message);
-      if (Array.isArray(message.tool_calls) && message.tool_calls.length) {
-        previous.tool_calls = [...(previous.tool_calls || []), ...message.tool_calls];
-      }
-      continue;
-    }
-    coalesced.push(message);
-  }
-  return coalesced;
-}
-
 function restoreNativeReasoningContent(messages) {
   if (!Array.isArray(messages)) return messages;
   return messages.map((message) => {
@@ -423,65 +375,115 @@ function ensureToolCallReasoningContent(messages) {
   });
 }
 
-// Strict chat-completions providers (Console Go / MiniMax / similar) reject any
-// assistant tool_calls message whose matching tool results are incomplete or
-// separated by non-tool traffic. LiteLLM's Responses->chat translation and
-// Codex remote compact can emit orphan tool_calls after interrupted tool runs
-// or partial history. Insert synthetic tool results for missing call ids so
-// the request stays well-formed. Prefer a short machine-readable stub over
-// dropping history, which would erase useful prior context.
+// Strict Chat providers require adjacent results. Recover present results by ID;
+// use the unavailable marker only for calls genuinely missing from the history.
 const SYNTHETIC_TOOL_RESULT =
   "[tool result unavailable: prior tool execution was interrupted or omitted from history]";
 
-function toolCallIds(message) {
-  if (!Array.isArray(message?.tool_calls)) return [];
-  return message.tool_calls
-    .map((call) => (typeof call?.id === "string" ? call.id : ""))
-    .filter(Boolean);
+function invalidChatToolHistory(reason) {
+  const error = new Error(
+    "Cannot safely replay tool history: " + reason +
+    " Restore the matching call/result history before retrying.",
+  );
+  error.status = 400;
+  error.code = "invalid_chat_tool_history";
+  return error;
 }
 
 function ensureToolResultsForCalls(messages) {
   if (!Array.isArray(messages) || messages.length === 0) return messages;
+  const latestCall = new Map();
+  const callsByMessage = new Map();
+  const resultOwners = new Map();
+
+  // Index first: a present result must never become an unavailable placeholder.
+  // Reused IDs are unambiguous only after the earlier call has its result.
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (message?.role === "assistant" && Array.isArray(message.tool_calls)) {
+      const calls = [];
+      const blockIds = new Set();
+      for (const call of message.tool_calls) {
+        const id = call?.id;
+        if (typeof id !== "string" || !id.trim()) {
+          throw invalidChatToolHistory("A tool call has no usable ID.");
+        }
+        if (blockIds.has(id) || (latestCall.has(id) && !latestCall.get(id).result)) {
+          throw invalidChatToolHistory("Repeated tool call IDs are ambiguous.");
+        }
+        const owner = { id, index, result: undefined };
+        calls.push(owner);
+        blockIds.add(id);
+        latestCall.set(id, owner);
+      }
+      callsByMessage.set(index, calls);
+    }
+    if (message?.role !== "tool") continue;
+    const id = message.tool_call_id;
+    if (typeof id !== "string" || !id.trim()) {
+      throw invalidChatToolHistory("A tool result has no usable call ID.");
+    }
+    const owner = latestCall.get(id);
+    if (!owner) {
+      throw invalidChatToolHistory("A real tool result has no preceding matching call.");
+    }
+    if (owner.result) {
+      throw invalidChatToolHistory("Multiple real results claim the same tool call.");
+    }
+    owner.result = { message, index };
+    resultOwners.set(index, owner);
+  }
+
   const repaired = [];
   let index = 0;
   while (index < messages.length) {
     const message = messages[index];
-    // Tool rows are only valid immediately after their assistant tool_calls.
-    // Anything else (orphans after compaction, duplicates after intervening
-    // turns) is dropped so strict providers do not reject the whole request.
     if (message?.role === "tool") {
-      index += 1;
-      continue;
+      throw invalidChatToolHistory("A real result cannot be paired without crossing a conversation boundary.");
     }
-
     repaired.push(message);
-    const callIds = toolCallIds(message);
-    if (message?.role !== "assistant" || callIds.length === 0) {
+    const calls = callsByMessage.get(index);
+    if (!calls?.length) {
       index += 1;
       continue;
     }
 
+    const callerIndex = index;
+    const results = [];
+    const instructions = [];
     index += 1;
-    const toolsById = new Map();
-    while (index < messages.length && messages[index]?.role === "tool") {
-      const toolMessage = messages[index];
-      const toolCallId =
-        typeof toolMessage?.tool_call_id === "string" ? toolMessage.tool_call_id : "";
-      if (toolCallId && callIds.includes(toolCallId) && !toolsById.has(toolCallId)) {
-        toolsById.set(toolCallId, toolMessage);
+    // Move only results across instruction rows; keep instructions in order
+    // before the next turn, and keep caller reasoning and signatures attached.
+    while (index < messages.length) {
+      const next = messages[index];
+      if (next?.role === "developer" || next?.role === "system") {
+        instructions.push(next);
+      } else if (next?.role === "tool") {
+        if (resultOwners.get(index)?.index !== callerIndex) {
+          throw invalidChatToolHistory("A real result belongs to a different tool-call block.");
+        }
+        results.push(next);
+      } else {
+        break;
       }
       index += 1;
     }
-
-    for (const callId of callIds) {
-      repaired.push(
-        toolsById.get(callId) || {
-          role: "tool",
-          tool_call_id: callId,
-          content: SYNTHETIC_TOOL_RESULT,
-        },
-      );
+    for (const call of calls) {
+      if (call.result && call.result.index >= index) {
+        throw invalidChatToolHistory("A real result is separated from its call by a conversation boundary.");
+      }
     }
+    repaired.push(...results);
+    for (const call of calls) {
+      if (!call.result) {
+        repaired.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: SYNTHETIC_TOOL_RESULT,
+        });
+      }
+    }
+    repaired.push(...instructions);
   }
   return repaired;
 }
@@ -836,7 +838,8 @@ function trimTrailingModelTurns(messages) {
 
 function sanitizeChatToolHistory(messages, provider, model) {
   if (!Array.isArray(messages)) return messages;
-  const repaired = ensureToolResultsForCalls(coalesceAssistantMessages(messages));
+  coalesceAssistantRuns(messages);
+  const repaired = ensureToolResultsForCalls(messages);
   let cleaned = repaired;
   if (isGeminiProvider(provider, model)) {
     cleaned = ensureGeminiThoughtSignatures(sanitizeGeminiImageContent(repaired));
@@ -2465,6 +2468,9 @@ const server = http.createServer((request, response) => {
         error: error.code === "compatibility_layer_disabled"
           ? compatibilityLayerError("the requested route").error : transport || (error?.code === "upstream_redirect_refused" ? {
           type: "provider_redirect_refused",
+          message: error.message,
+        } : error?.code === "invalid_chat_tool_history" ? {
+          type: "invalid_chat_tool_history",
           message: error.message,
         } : {
           type: "provider_api_proxy_error",

@@ -296,7 +296,7 @@ function mergeAssistantRun(run) {
   return merged;
 }
 
-function coalesceAssistantRuns(messages) {
+export function coalesceAssistantRuns(messages) {
   if (!Array.isArray(messages)) return;
   if (!messages.some(hasToolCalls)) return;
   for (let index = 0; index < messages.length; ) {

@@ -11,7 +11,7 @@ import { userModelEntry } from "../src/user-models.mjs";
 import { waitForHealth } from "../src/health-probe.mjs";
 import { openPort } from "./port-pool.mjs";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const root = process.env.MODEL_ROUTER_TEST_SOURCE_ROOT || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INTERNAL_KEY = "generic-routing-internal-key-with-sufficient-length";
 
 function json(response, status, payload) {
@@ -87,6 +87,156 @@ async function stop(child) {
   child.kill("SIGTERM");
   await new Promise((resolve) => child.once("exit", resolve));
 }
+
+test("generic Chat history preserves real results and instruction authority", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "generic-tool-history-"));
+  const providersFile = path.join(directory, "providers.json");
+  const modelsFile = path.join(directory, "models.json");
+  const requests = [];
+  const upstream = await listen(async (request, response) => {
+    requests.push(await requestJson(request));
+    json(response, 200, { choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }] });
+  });
+  const providerId = "history-fixture";
+  const models = ["sonnet-fixture", "deepseek-fixture"].map((upstreamId, priority) =>
+    userModelEntry({ providerId, upstreamId, priority }));
+  writeFileSync(providersFile, JSON.stringify({ version: 1, providers: [{
+    id: providerId, displayName: "History fixture", adapter: "openai-chat",
+    baseUrl: "http://127.0.0.1:" + upstream.port + "/v1", headers: {}, allowPrivate: true, enabled: true,
+  }] }));
+  writeFileSync(modelsFile, JSON.stringify({ version: 1, models }));
+  const port = await openPort();
+  const forwarder = runForwarder({
+    MODEL_ROUTER_API_PORT: String(port),
+    MODEL_ROUTER_STATE_DIR: path.join(directory, "state"),
+    MODEL_ROUTER_GENERIC_PROVIDERS: providersFile,
+    MODEL_ROUTER_USER_MODELS: modelsFile,
+  });
+  t.after(async () => {
+    await stop(forwarder);
+    await close(upstream.server);
+    rmSync(directory, { recursive: true, force: true });
+  });
+  await waitForForwarder(port, forwarder);
+  const call = id => ({ id, type: "function", function: { name: "read", arguments: "{}" } });
+  const result = (id, content = "source " + id + "\nUnicode: \u{1f9ea}") =>
+    ({ role: "tool", tool_call_id: id, content, name: "read" });
+  const instruction = (id, role = "developer") =>
+    ({ role, content: [{ type: "text", text: "Keep instruction " + id + " exactly." }], name: id });
+  const user = { role: "user", content: "Assess the supplied material." };
+  const post = messages => fetch("http://127.0.0.1:" + port + "/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: "Bearer " + INTERNAL_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: models[0].gatewayModel, messages }),
+  });
+
+  async function preserved(name, messages) {
+    await t.test(name, async () => {
+      const expectedTools = messages.filter(m => m.role === "tool");
+      const expectedInstructions = messages.filter(m => ["developer", "system"].includes(m.role));
+      const original = structuredClone(messages);
+      const response = await post(messages);
+      assert.equal(response.status, 200, await response.text());
+      const sent = requests.at(-1).messages;
+      assert.deepEqual(sent.filter(m => m.role === "tool"), expectedTools);
+      assert.deepEqual(sent.filter(m => ["developer", "system"].includes(m.role)), expectedInstructions);
+      assert.deepEqual(sent.filter(m => m.role !== "tool"), messages.filter(m => m.role !== "tool"));
+      assert.deepEqual(messages, original);
+      const again = await post(sent);
+      assert.equal(again.status, 200, await again.text());
+      assert.deepEqual(requests.at(-1).messages, sent);
+    });
+  }
+
+  // Synthetic versions of the two recorded first batches. No private chat text.
+  for (const [name, count, separators] of [["Sonnet", 3, 4], ["DeepSeek", 6, 7]]) {
+    const calls = Array.from({ length: count }, (_, i) => call(name + "_" + i));
+    await preserved(name + " batch", [
+      user, { role: "assistant", content: "Reading.", tool_calls: calls,
+        reasoning_content: "Keep reasoning attached.", name: "reader", refusal: null,
+        provider_signature: { opaque: "unchanged" } },
+      ...Array.from({ length: separators }, (_, i) => instruction(name + "_instruction_" + i)),
+      ...calls.map(c => result(c.id)),
+    ]);
+  }
+  await preserved("instructions between reversed result arrivals", [
+    user, { role: "assistant", content: null, tool_calls: [call("A"), call("B")] },
+    instruction("first", "system"), result("B", [{ type: "text", text: "Structured\n\u{1f9ea}" }]),
+    instruction("second"), result("A"),
+  ]);
+  await preserved("already valid results retain all fields", [
+    user, { role: "assistant", content: null, tool_calls: [call("A")] },
+    result("A", [{ type: "text", text: "Exact result" }]), instruction("after"),
+  ]);
+  await preserved("empty real results are retained", [
+    user, { role: "assistant", tool_calls: [call("A")] }, instruction("empty"), result("A", ""),
+  ]);
+  await preserved("completed blocks may reuse a call ID", [
+    user, { role: "assistant", tool_calls: [call("A")] }, instruction("first"), result("A", "first result"),
+    { role: "user", content: "Continue." },
+    { role: "assistant", tool_calls: [call("A")] }, instruction("second"), result("A", "second result"),
+  ]);
+  await preserved("independent call blocks keep their own results", [
+    user, { role: "assistant", tool_calls: [call("A")] }, instruction("first"), result("A"),
+    { role: "assistant", tool_calls: [call("B")] }, instruction("second"), result("B"),
+  ]);
+  await t.test("merging split assistant items retains metadata", async () => {
+    const response = await post([
+      user, { role: "assistant", content: "Opening.", reasoning_content: "first" },
+      { role: "assistant", content: null, name: "reader", refusal: "refusal metadata",
+        reasoning_content: "second", tool_calls: [call("A")] }, result("A"),
+    ]);
+    assert.equal(response.status, 200, await response.text());
+    const sent = requests.at(-1).messages;
+    assert.deepEqual(sent[1], {
+      role: "assistant", content: "Opening.", reasoning_content: "first\nsecond",
+      name: "reader", refusal: "refusal metadata", tool_calls: [call("A")],
+    });
+    assert.deepEqual(sent[2], result("A"));
+  });
+  await t.test("only a genuinely absent result gets an unavailable marker", async () => {
+    const response = await post([
+      user, { role: "assistant", tool_calls: [call("A"), call("missing")] },
+      instruction("current"), result("A"),
+    ]);
+    assert.equal(response.status, 200, await response.text());
+    const sent = requests.at(-1).messages;
+    assert.deepEqual(sent[2], result("A"));
+    assert.equal(sent[3].tool_call_id, "missing");
+    assert.match(sent[3].content, /tool result unavailable/);
+    assert.deepEqual(sent[4], instruction("current"));
+  });
+
+  const invalid = [
+    ["unowned result", [user, result("orphan")]],
+    ["result before its owner", [user, result("A"), { role: "assistant", tool_calls: [call("A")] }]],
+    ["result beyond a user turn", [user, { role: "assistant", tool_calls: [call("A")] },
+      { role: "user", content: "New request." }, result("A")]],
+    ["result beyond another assistant call", [user, { role: "assistant", tool_calls: [call("A")] },
+      instruction("between"), { role: "assistant", tool_calls: [call("B")] }, result("A"), result("B")]],
+    ["duplicate calls", [user, { role: "assistant", tool_calls: [call("A"), call("A")] }, result("A")]],
+    ["duplicate results", [user, { role: "assistant", tool_calls: [call("A")] }, result("A"), result("A", "different")]],
+    ["missing result ID", [user, { role: "assistant", tool_calls: [call("A")] }, { role: "tool", content: "real" }]],
+    ["blank result ID", [user, { role: "assistant", tool_calls: [call("A")] }, result(" ")]],
+    ["missing call ID", [user, { role: "assistant", tool_calls: [{ type: "function", function: { name: "read", arguments: "{}" } }] }, result("A")]],
+    ["conflicting caller metadata", [user,
+      { role: "assistant", name: "first", tool_calls: [call("A")] },
+      { role: "assistant", name: "second", tool_calls: [call("B")] }, result("A"), result("B")]],
+  ];
+  for (const [name, messages] of invalid) {
+    await t.test("reject " + name + " before forwarding", async () => {
+      const before = requests.length;
+      const response = await post(messages);
+      const body = await response.json();
+      assert.equal(response.status, 400, JSON.stringify(body));
+      assert.equal(body.error.type, "invalid_chat_tool_history");
+      assert.match(body.error.message, /Cannot safely replay tool history/);
+      // A result cannot be silently discarded merely to produce a valid request.
+      assert.equal(requests.length, before);
+    });
+  }
+});
+
 
 test("generic forwarder readiness accepts startup beyond five seconds", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "generic-routing-slow-start-"));

@@ -80,6 +80,11 @@ export function extractUpstreamDetail(bodyText) {
   return message.length > DETAIL_LIMIT ? message.slice(0, DETAIL_LIMIT) : message;
 }
 
+function isLocalChatToolHistoryFailure(detail) {
+  return detail.startsWith("Cannot safely replay tool history: ") &&
+    detail.endsWith("Restore the matching call/result history before retrying.");
+}
+
 // Providers report exhausted usage under many statuses (OpenAI 429
 // insufficient_quota, DeepSeek 402, xAI 403, Anthropic 400), so the body has
 // to be checked before the status mapping — a quota 429 must not advise
@@ -217,11 +222,12 @@ export function contextLengthFailure(bodyText) {
 }
 
 // Status is kept separate from the translated body because callers also relay
-// ordinary gateway statuses byte-for-status. Only this deterministic request
-// rejection is corrected from the gateway's 5xx wrapper to the OpenAI-shaped
+// ordinary gateway statuses byte-for-status. Deterministic history and context
+// rejections are corrected from a gateway's 5xx wrapper to the OpenAI-shaped
 // 400 that tells Codex not to retry.
 export function gatewayErrorStatus({ status, bodyText }) {
-  return contextLengthFailure(bodyText) ? 400 : Number(status);
+  return isLocalChatToolHistoryFailure(extractUpstreamDetail(bodyText)) || contextLengthFailure(bodyText)
+    ? 400 : Number(status);
 }
 
 // The same two questions `describeFailure` asks, in the same order, answered for
@@ -362,6 +368,9 @@ export function translateGatewayError({
     return localToolArgumentConversionError(bodyText);
   }
   const detail = extractUpstreamDetail(bodyText);
+  if (isLocalChatToolHistoryFailure(detail)) {
+    return { error: { message: detail, type: "invalid_request_error", param: "messages", code: "invalid_chat_tool_history" } };
+  }
   const context = contextLengthFailure(bodyText);
   if (context) {
     const measured =
